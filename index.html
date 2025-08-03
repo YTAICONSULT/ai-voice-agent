@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Voice Agent</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        #controls button { margin: 5px; padding: 10px 20px; font-size: 16px; }
+        #messages { margin-top: 20px; border: 1px solid #ccc; padding: 10px; min-height: 100px; overflow-y: scroll; }
+        #status { margin-top: 10px; font-weight: bold; color: blue; }
+    </style>
+</head>
+<body>
+    <h1>AI Voice Agent</h1>
+
+    <div id="controls">
+        <button id="startButton">Start Listening</button>
+    </div>
+
+    <div id="status">
+        Status: Not listening
+    </div>
+
+    <div id="messages">
+        <p>Click "Start Listening" to begin the conversation.</p>
+    </div>
+
+    <audio id="audioPlayback" controls></audio>
+
+    <script>
+        const startButton = document.getElementById('startButton');
+        const messagesDiv = document.getElementById('messages');
+        const audioPlayback = document.getElementById('audioPlayback');
+        const statusDiv = document.getElementById('status');
+
+        let audioContext;
+        let mediaStreamSource;
+        let analyser;
+        let scriptProcessor;
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+        let silenceStart = 0;
+        const SILENCE_THRESHOLD = -50; // dB, adjust as needed
+        const SILENCE_DURATION = 1000; // ms, how long silence must last to trigger end of speech
+        const SAMPLE_RATE = 44100; // Standard sample rate
+
+        async function startListening() {
+            if (isRecording) return; // Prevent multiple starts
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                mediaStreamSource = audioContext.createMediaStreamSource(stream);
+                analyser = audioContext.createAnalyser();
+                scriptProcessor = audioContext.createScriptProcessor(2048, 1, 1); // Buffer size, input channels, output channels
+
+                mediaStreamSource.connect(analyser);
+                analyser.connect(scriptProcessor);
+                scriptProcessor.connect(audioContext.destination);
+
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+
+                mediaRecorder.ondataavailable = event => {
+                    audioChunks.push(event.data);
+                };
+
+                mediaRecorder.onstop = async () => {
+                    if (audioChunks.length === 0) {
+                        console.log("No audio recorded for this segment.");
+                        statusDiv.textContent = "Status: Listening...";
+                        return; // Don't send empty audio
+                    }
+
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/m4a' });
+                    const formData = new FormData();
+                    formData.append('audio', audioBlob, 'recording.m4a');
+
+                    messagesDiv.innerHTML += '<p>Sending audio to server...</p>';
+                    statusDiv.textContent = "Status: Processing...";
+
+                    try {
+                        const response = await fetch('/process_audio', {
+                            method: 'POST',
+                            body: formData
+                        });
+
+                        if (response.ok) {
+                            const audioBlobResponse = await response.blob();
+                            const audioUrl = URL.createObjectURL(audioBlobResponse);
+                            audioPlayback.src = audioUrl;
+                            audioPlayback.play();
+                            messagesDiv.innerHTML += '<p>Received response from AI. Playing audio.</p>';
+                        } else {
+                            const errorData = await response.json();
+                            messagesDiv.innerHTML += `<p style="color: red;">Error: ${errorData.error}</p>`;
+                        }
+                    } catch (error) {
+                        messagesDiv.innerHTML += `<p style="color: red;">Network error: ${error}</p>`;
+                    } finally {
+                        // Reset for next utterance
+                        audioChunks = [];
+                        isRecording = false;
+                        statusDiv.textContent = "Status: Listening...";
+                        // Re-start listening if needed, or wait for next speech
+                        // For continuous conversation, we'll rely on VAD to restart recording
+                    }
+                };
+
+                scriptProcessor.onaudioprocess = function(event) {
+                    const inputBuffer = event.inputBuffer.getChannelData(0);
+                    let sum = 0.0;
+                    for (let i = 0; i < inputBuffer.length; i++) {
+                        sum += inputBuffer[i] * inputBuffer[i];
+                    }
+                    const rms = Math.sqrt(sum / inputBuffer.length);
+                    const db = 20 * Math.log10(rms); // Convert RMS to dB
+
+                    if (db > SILENCE_THRESHOLD) {
+                        // Speech detected
+                        if (!isRecording) {
+                            mediaRecorder.start();
+                            isRecording = true;
+                            messagesDiv.innerHTML += '<p>Recording utterance...</p>';
+                            statusDiv.textContent = "Status: Speaking...";
+                        }
+                        silenceStart = audioContext.currentTime; // Reset silence timer
+                    } else {
+                        // Silence detected
+                        if (isRecording && (audioContext.currentTime - silenceStart) * 1000 > SILENCE_DURATION) {
+                            // End of speech
+                            mediaRecorder.stop();
+                            isRecording = false;
+                            messagesDiv.innerHTML += '<p>End of speech detected. Processing...</p>';
+                            statusDiv.textContent = "Status: Detected silence.";
+                        }
+                    }
+                };
+
+                startButton.disabled = true;
+                statusDiv.textContent = "Status: Listening...";
+                messagesDiv.innerHTML += '<p>Microphone access granted. Waiting for speech...</p>';
+
+            } catch (err) {
+                console.error('Error accessing microphone:', err);
+                messagesDiv.innerHTML += `<p style="color: red;">Error accessing microphone: ${err.message}</p>`;
+                statusDiv.textContent = "Status: Error";
+            }
+        }
+
+        startButton.addEventListener('click', startListening);
+    </script>
+</body>
+</html>

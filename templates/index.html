@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Voice Agent</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        #controls button { margin: 5px; padding: 10px 20px; font-size: 16px; }
+        #messages { margin-top: 20px; border: 1px solid #ccc; padding: 10px; min-height: 100px; max-height: 300px; overflow-y: auto; }
+        #status { margin-top: 10px; font-weight: bold; color: blue; }
+    </style>
+</head>
+<body>
+    <h1>AI Voice Agent</h1>
+
+    <div id="controls">
+        <button id="startButton">Start Listening</button>
+        <button id="stopListeningButton" disabled>Stop Listening</button>
+    </div>
+
+    <div id="status">
+        Status: Not listening
+    </div>
+
+    <div id="messages">
+        <p>Click "Start Listening" to begin the conversation.</p>
+    </div>
+
+    <audio id="audioPlayback" controls></audio>
+
+    <script>
+        const startButton = document.getElementById('startButton');
+        const stopListeningButton = document.getElementById('stopListeningButton'); 
+        const messagesDiv = document.getElementById('messages');
+        const audioPlayback = document.getElementById('audioPlayback');
+        const statusDiv = document.getElementById('status');
+
+        let audioContext;
+        let mediaStreamSource;
+        let analyser;
+        let scriptProcessor;
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+        let silenceStart = 0;
+        let isModelSpeaking = false; 
+        let isProcessingAudio = false; 
+        let currentStream; 
+
+        const SILENCE_THRESHOLD = -40; // dB, for normal speech detection
+        const BARGE_IN_THRESHOLD = -30; // dB, for detecting user speech over AI's voice (must be louder)
+        const SILENCE_DURATION = 1000; 
+        const SAMPLE_RATE = 44100; 
+
+        function appendMessage(text, sender = 'system') {
+            const p = document.createElement('p');
+            p.innerHTML = `<strong>${sender}:</strong> ${text}`;
+            messagesDiv.appendChild(p);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight; 
+        }
+
+        function stopListening() {
+            console.log("stopListening function called.");
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+                console.log("MediaRecorder stopped.");
+            }
+            if (currentStream) {
+                currentStream.getTracks().forEach(track => track.stop());
+                console.log("Microphone stream tracks stopped.");
+            }
+            if (scriptProcessor) {
+                scriptProcessor.disconnect();
+                console.log("ScriptProcessor disconnected.");
+            }
+            if (analyser) {
+                analyser.disconnect();
+            }
+            if (mediaStreamSource) {
+                mediaStreamSource.disconnect();
+                console.log("MediaStreamSource disconnected.");
+            }
+            if (audioContext) {
+                audioContext.close().then(() => {
+                    console.log("AudioContext closed.");
+                });
+            }
+
+            // Explicitly stop and clear audio playback to prevent onended from firing
+            audioPlayback.pause();
+            audioPlayback.src = '';
+            audioPlayback.load(); // Reload to clear any pending audio
+
+            isRecording = false;
+            isModelSpeaking = false;
+            isProcessingAudio = false;
+            audioChunks = [];
+
+            startButton.disabled = false;
+            stopListeningButton.disabled = true;
+            statusDiv.textContent = "Status: Not listening";
+            appendMessage('Listening stopped.', 'system');
+            console.log("Status set to 'Not listening'.");
+        }
+
+        async function startListening() {
+            if (isRecording) return; 
+
+            try {
+                currentStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                mediaStreamSource = audioContext.createMediaStreamSource(currentStream);
+                analyser = audioContext.createAnalyser();
+                scriptProcessor = audioContext.createScriptProcessor(2048, 1, 1); 
+
+                mediaStreamSource.connect(analyser);
+                analyser.connect(scriptProcessor);
+                scriptProcessor.connect(audioContext.destination);
+
+                mediaRecorder = new MediaRecorder(currentStream);
+                audioChunks = [];
+
+                mediaRecorder.ondataavailable = event => {
+                    audioChunks.push(event.data);
+                };
+
+                mediaRecorder.onstop = async () => {
+                    isProcessingAudio = true; 
+
+                    if (audioChunks.length === 0) {
+                        console.log("No audio recorded for this segment.");
+                        statusDiv.textContent = "Status: Listening...";
+                        isProcessingAudio = false; 
+                        return; 
+                    }
+
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/m4a' });
+                    const formData = new FormData();
+                    formData.append('audio', audioBlob, 'recording.m4a');
+
+                    appendMessage('Sending audio to server...', 'system');
+                    statusDiv.textContent = "Status: Processing...";
+
+                    try {
+                        const response = await fetch('/process_audio', {
+                            method: 'POST',
+                            body: formData
+                        });
+
+                        if (response.ok) {
+                            const responseData = await response.json(); 
+                            console.log("Received response data:", responseData);
+
+                            const audioBlobResponse = new Blob([new Uint8Array(responseData.audio_data)], { type: 'audio/wav' }); 
+                            const audioUrl = URL.createObjectURL(audioBlobResponse);
+                            audioPlayback.src = audioUrl;
+                            isModelSpeaking = true; 
+                            audioPlayback.play();
+                            appendMessage(responseData.transcription, 'user'); 
+                            appendMessage(responseData.llm_response, 'AI'); 
+                            appendMessage('Received response from AI. Playing audio.', 'system');
+                            console.log("Audio playback initiated.");
+                        } else {
+                            const errorData = await response.json();
+                            appendMessage(`Error: ${errorData.error}`, 'system');
+                            console.error("Server error:", errorData);
+                        }
+                    } catch (error) {
+                        appendMessage(`Network error: ${error}`, 'system');
+                        console.error("Fetch or network error:", error);
+                    } finally {
+                        audioChunks = [];
+                        isRecording = false;
+                        isProcessingAudio = false; 
+                    }
+                };
+
+                audioPlayback.onended = () => {
+                    // Only update status if the model was actually speaking and not interrupted
+                    if (isModelSpeaking) { 
+                        isModelSpeaking = false;
+                        statusDiv.textContent = "Status: Listening...";
+                        appendMessage('Model finished speaking. Listening for your input...', 'system');
+                        console.log("Audio playback ended. Listening resumed.");
+                    } else {
+                        console.log("Audio playback ended, but model was already interrupted or listening is manually stopped.");
+                    }
+                };
+
+                scriptProcessor.onaudioprocess = function(event) {
+                    if (isProcessingAudio) return;
+
+                    const inputBuffer = event.inputBuffer.getChannelData(0);
+                    let sum = 0.0;
+                    for (let i = 0; i < inputBuffer.length; i++) {
+                        sum += inputBuffer[i] * inputBuffer[i];
+                    }
+                    const rms = Math.sqrt(sum / inputBuffer.length);
+                    const db = 20 * Math.log10(rms); 
+
+                    if (isModelSpeaking) {
+                        // AI is currently speaking. We are looking for user's voice to barge-in.
+                        // User's voice must be significantly louder than AI's output to trigger barge-in.
+                        if (db > BARGE_IN_THRESHOLD) { 
+                            console.log("Barge-in detected! Cutting off AI audio.");
+                            audioPlayback.pause();
+                            audioPlayback.src = ''; // Clear source
+                            audioPlayback.load(); // Load to apply source change
+                            isModelSpeaking = false; // AI is no longer speaking
+                            appendMessage('Barge-in detected. Listening for your input...', 'system');
+                            statusDiv.textContent = "Status: Listening..."; // Transition to listening state
+                        }
+                        return; // Important: Don't proceed to normal recording logic while AI is speaking.
+                    }
+
+                    // If we reach here, AI is NOT speaking (either finished naturally or was barged-in).
+                    // Now, apply normal VAD logic for user speech.
+                    if (db > SILENCE_THRESHOLD) {
+                        // User speech detected
+                        if (!isRecording) {
+                            mediaRecorder.start();
+                            isRecording = true;
+                            appendMessage('Recording utterance...', 'system');
+                            statusDiv.textContent = "Status: Speaking...";
+                        }
+                        silenceStart = audioContext.currentTime; 
+                    } else {
+                        // Silence detected
+                        if (isRecording && (audioContext.currentTime - silenceStart) * 1000 > SILENCE_DURATION) {
+                            mediaRecorder.stop();
+                            isRecording = false; 
+                            appendMessage('End of speech detected. Processing...', 'system');
+                            statusDiv.textContent = "Status: Detected silence.";
+                        }
+                    }
+                };
+
+                startButton.disabled = true;
+                stopListeningButton.disabled = false; 
+                statusDiv.textContent = "Status: Listening...";
+                appendMessage('Microphone access granted. Waiting for speech...', 'system');
+
+            } catch (err) {
+                console.error('Error accessing microphone:', err);
+                appendMessage(`Error accessing microphone: ${err.message}`, 'system');
+                statusDiv.textContent = "Status: Error";
+            }
+        }
+
+        startButton.addEventListener('click', startListening);
+        stopListeningButton.addEventListener('click', stopListening); 
+    </script>
+</body>
+</html>
